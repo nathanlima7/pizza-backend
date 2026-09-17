@@ -29,8 +29,8 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) {
 
 // ---------- CORS ----------
 const ALLOWED_ORIGINS = [
-  'https://dafamilia.netlify.app',
-  'https://admin-dafamilia.netlify.app',
+  'https://pizzadafamilia.netlify.app',
+  'https://admindafamilia.netlify.app',
   'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500'
