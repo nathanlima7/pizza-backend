@@ -31,7 +31,7 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) {
 const ALLOWED_ORIGINS = [
   'https://pizzadafamilia.netlify.app',
   'https://admindafamilia.netlify.app',
-  'http://localhost:3000',
+  'https://pizzadafamilia-test.netlify.app',
   'http://localhost:5500',
   'http://127.0.0.1:5500'
 ];
@@ -61,9 +61,35 @@ const TIME_LIMITS = {
   'Tamboril': 40,
   'Boi Morto': 40,
   "Buraco D'água": 40,
-  'Pitombeira': 40
+  'Pitombeira': 40,
+  'Retirada no local': 15
 };
 const DEFAULT_TIME_LIMIT = 30;
+
+// ---------- Tabela de preços para validação ----------
+// IMPORTANTE: mantenha em sincronia com o app.js
+const PRICE_TABLE = {
+  pizzas: {
+    'Pequena': 30.00,
+    'Média':   40.00,
+    'Grande':  50.00,
+    'Família': 60.00
+  },
+  borderPrice: 10.00,
+  drinks: {
+    'Coca-Cola':    { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 8.00, '1,5L': 10.00, '2L': 12.00 },
+    'KWat':         { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 },
+    'Fanta Laranja':{ '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 },
+    'Fanta Uva':    { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 }
+  },
+  cakes: {
+    'Prestígio':   10.00,
+    'Dois Amores': 10.00,
+    'Brigadeiro':  10.00,
+    'Ninho':       10.00,
+    'Maracujá':    11.00
+  }
+};
 
 // ============================================================
 // HELPERS
@@ -125,10 +151,64 @@ function validateOrder(body) {
   if (!body || typeof body !== 'object') errors.push('Payload inválido');
   if (!body.customer?.name) errors.push('Nome do cliente é obrigatório');
   if (!body.customer?.phone) errors.push('Telefone é obrigatório');
-  if (!body.customer?.neighborhood) errors.push('Bairro é obrigatório');
   if (!Array.isArray(body.items) || body.items.length === 0) errors.push('Pedido sem itens');
   if (typeof body.total !== 'number') errors.push('Total inválido');
+
+  // Bairro só é obrigatório se for ENTREGA (não retirada)
+  const isRetirada = body.deliveryType === 'retirada';
+  if (!isRetirada && !body.customer?.neighborhood) {
+    errors.push('Bairro é obrigatório para entrega');
+  }
   return errors;
+}
+
+// ---------- Validação de preços no backend ----------
+// Compara os preços enviados pelo cliente com a tabela oficial
+// Evita que um usuário mal-intencionado envie preços adulterados
+function validatePricing(order) {
+  try {
+    let expectedSubtotal = 0;
+
+    for (const item of order.items) {
+      let unitPrice = 0;
+
+      if (item.type === 'pizza') {
+        const base = PRICE_TABLE.pizzas[item.size];
+        if (!base) return { valid: false, reason: `Tamanho de pizza inválido: ${item.size}` };
+        const border = (item.border && item.border !== 'Sem borda') ? PRICE_TABLE.borderPrice : 0;
+        unitPrice = base + border;
+      } else if (item.type === 'drink') {
+        const drinkTable = PRICE_TABLE.drinks[item.name];
+        if (!drinkTable) return { valid: false, reason: `Bebida inválida: ${item.name}` };
+        const price = drinkTable[item.size];
+        if (price == null) return { valid: false, reason: `Tamanho inválido para ${item.name}: ${item.size}` };
+        unitPrice = price;
+      } else if (item.type === 'cake') {
+        const price = PRICE_TABLE.cakes[item.name];
+        if (price == null) return { valid: false, reason: `Bolo inválido: ${item.name}` };
+        unitPrice = price;
+      } else {
+        return { valid: false, reason: `Tipo de item desconhecido: ${item.type}` };
+      }
+
+      expectedSubtotal += unitPrice * item.quantity;
+    }
+
+    const expectedTotal = expectedSubtotal + (order.deliveryFee || 0);
+
+    // Tolerância de R$ 0,50 para arredondamento de floats
+    if (Math.abs(expectedTotal - order.total) > 0.5) {
+      return {
+        valid: false,
+        reason: 'Divergência de preço',
+        expected: expectedTotal,
+        received: order.total
+      };
+    }
+    return { valid: true };
+  } catch (e) {
+    return { valid: false, reason: 'Erro ao validar preço: ' + e.message };
+  }
 }
 
 // ============================================================
@@ -142,16 +222,28 @@ app.post('/api/orders', (req, res) => {
     return res.status(400).json({ error: 'Dados inválidos', details: errors });
   }
 
+  // ---------- Valida preços contra a tabela oficial ----------
+  const pricing = validatePricing(req.body);
+  if (!pricing.valid) {
+    console.warn('[PREÇO DIVERGENTE]', pricing);
+    return res.status(400).json({ error: 'Divergência de preço detectada' });
+  }
+
   const orderId = crypto.randomUUID();
   const clientToken = crypto.randomBytes(24).toString('hex');
 
-  const timeLimit = TIME_LIMITS[req.body.customer.neighborhood] || DEFAULT_TIME_LIMIT;
+  // ---------- Tempo alvo: retirada ou por bairro ----------
+  const isRetirada = req.body.deliveryType === 'retirada';
+  const timeLimit = isRetirada
+    ? TIME_LIMITS['Retirada no local']
+    : (TIME_LIMITS[req.body.customer?.neighborhood] || DEFAULT_TIME_LIMIT);
 
   const order = {
     id: orderId,
     createdAt: new Date().toISOString(),
     status: 'novo',
     timeLimitMinutes: timeLimit,
+    deliveryType: req.body.deliveryType || 'entrega',   // ← NOVO
     customer: req.body.customer,
     items: req.body.items,
     payment: req.body.payment,
@@ -179,10 +271,10 @@ app.post('/api/orders', (req, res) => {
     });
   }
 
-  // Avisa o ADM
   broadcastToAdmins({ type: 'new_order', order });
 
-  console.log(`[NOVO] ${order.customer.name} • ${order.customer.neighborhood} • R$ ${order.total.toFixed(2)}`);
+  const local = isRetirada ? 'Retirada' : (order.customer.neighborhood || '—');
+  console.log(`[NOVO] ${order.customer.name} • ${local} • R$ ${order.total.toFixed(2)}`);
 
   res.status(201).json({
     ok: true,
@@ -311,10 +403,11 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
   broadcastToAdmins({ type: 'order_updated', order });
 
   // Notifica o cliente
+    const isRetirada = order.deliveryType === 'retirada';
   const messages = {
-    preparando:    'Sua pizza está no forno! 🔥',
-    saiu_entrega:  'Sua pizza saiu para entrega! 🛵',
-    entregue:      'Pedido entregue. Bom apetite! 🍕',
+    preparando:    isRetirada ? 'Seu pedido está sendo preparado! 🔥' : 'Sua pizza está no forno! 🔥',
+    saiu_entrega:  isRetirada ? 'Seu pedido está pronto para retirada! 🏠' : 'Sua pizza saiu para entrega! 🛵',
+    entregue:      isRetirada ? 'Pedido retirado. Bom apetite! 🍕' : 'Pedido entregue. Bom apetite! 🍕',
     novo:          'Pedido recebido!'
   };
   notifyClient(id, status, messages[status] || `Status: ${status}`);
