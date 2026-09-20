@@ -30,8 +30,9 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) {
 // ---------- CORS ----------
 const ALLOWED_ORIGINS = [
   'https://pizzadafamilia.netlify.app',
-  'https://admindafamilia.netlify.app',
   'https://pizzadafamilia-test.netlify.app',
+  'https://admindafamilia.netlify.app',
+  'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500'
 ];
@@ -45,11 +46,11 @@ app.use(cors({
 app.use(express.json({ limit: '100kb' }));
 
 // ---------- Estado em memória ----------
-const orders = new Map();             // id -> order
-const orderTokens = new Map();        // id -> token secreto do cliente
-const clientStreams = new Map();      // id -> Set(res)  (clientes SSE por pedido)
-const adminStreams = new Set();       // Set(res) do ADM
-const pushSubscriptions = new Map();  // id -> subscription (Web Push)
+const orders = new Map();
+const orderTokens = new Map();
+const clientStreams = new Map();
+const adminStreams = new Set();
+const pushSubscriptions = new Map();
 const MAX_ORDERS = 200;
 
 // ---------- Tempo alvo por bairro (minutos) ----------
@@ -65,31 +66,6 @@ const TIME_LIMITS = {
   'Retirada no local': 15
 };
 const DEFAULT_TIME_LIMIT = 30;
-
-// ---------- Tabela de preços para validação ----------
-// IMPORTANTE: mantenha em sincronia com o app.js
-const PRICE_TABLE = {
-  pizzas: {
-    'Pequena': 30.00,
-    'Média':   40.00,
-    'Grande':  50.00,
-    'Família': 60.00
-  },
-  borderPrice: 10.00,
-  drinks: {
-    'Coca-Cola':    { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 8.00, '1,5L': 10.00, '2L': 12.00 },
-    'KWat':         { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 },
-    'Fanta Laranja':{ '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 },
-    'Fanta Uva':    { '250ml': 4.00, 'Lata 350ml': 5.00, '1L': 7.50, '1,5L': 9.50,  '2L': 11.00 }
-  },
-  cakes: {
-    'Prestígio':   10.00,
-    'Dois Amores': 10.00,
-    'Brigadeiro':  10.00,
-    'Ninho':       10.00,
-    'Maracujá':    11.00
-  }
-};
 
 // ============================================================
 // HELPERS
@@ -120,7 +96,7 @@ async function sendWebPush(orderId, payload) {
   } catch (err) {
     console.warn('Falha no push:', err.statusCode);
     if (err.statusCode === 404 || err.statusCode === 410) {
-      pushSubscriptions.delete(orderId); // subscription expirada
+      pushSubscriptions.delete(orderId);
     }
   }
 }
@@ -162,55 +138,6 @@ function validateOrder(body) {
   return errors;
 }
 
-// ---------- Validação de preços no backend ----------
-// Compara os preços enviados pelo cliente com a tabela oficial
-// Evita que um usuário mal-intencionado envie preços adulterados
-function validatePricing(order) {
-  try {
-    let expectedSubtotal = 0;
-
-    for (const item of order.items) {
-      let unitPrice = 0;
-
-      if (item.type === 'pizza') {
-        const base = PRICE_TABLE.pizzas[item.size];
-        if (!base) return { valid: false, reason: `Tamanho de pizza inválido: ${item.size}` };
-        const border = (item.border && item.border !== 'Sem borda') ? PRICE_TABLE.borderPrice : 0;
-        unitPrice = base + border;
-      } else if (item.type === 'drink') {
-        const drinkTable = PRICE_TABLE.drinks[item.name];
-        if (!drinkTable) return { valid: false, reason: `Bebida inválida: ${item.name}` };
-        const price = drinkTable[item.size];
-        if (price == null) return { valid: false, reason: `Tamanho inválido para ${item.name}: ${item.size}` };
-        unitPrice = price;
-      } else if (item.type === 'cake') {
-        const price = PRICE_TABLE.cakes[item.name];
-        if (price == null) return { valid: false, reason: `Bolo inválido: ${item.name}` };
-        unitPrice = price;
-      } else {
-        return { valid: false, reason: `Tipo de item desconhecido: ${item.type}` };
-      }
-
-      expectedSubtotal += unitPrice * item.quantity;
-    }
-
-    const expectedTotal = expectedSubtotal + (order.deliveryFee || 0);
-
-    // Tolerância de R$ 0,50 para arredondamento de floats
-    if (Math.abs(expectedTotal - order.total) > 0.5) {
-      return {
-        valid: false,
-        reason: 'Divergência de preço',
-        expected: expectedTotal,
-        received: order.total
-      };
-    }
-    return { valid: true };
-  } catch (e) {
-    return { valid: false, reason: 'Erro ao validar preço: ' + e.message };
-  }
-}
-
 // ============================================================
 // ROTAS PÚBLICAS (cliente)
 // ============================================================
@@ -220,13 +147,6 @@ app.post('/api/orders', (req, res) => {
   const errors = validateOrder(req.body);
   if (errors.length > 0) {
     return res.status(400).json({ error: 'Dados inválidos', details: errors });
-  }
-
-  // ---------- Valida preços contra a tabela oficial ----------
-  const pricing = validatePricing(req.body);
-  if (!pricing.valid) {
-    console.warn('[PREÇO DIVERGENTE]', pricing);
-    return res.status(400).json({ error: 'Divergência de preço detectada' });
   }
 
   const orderId = crypto.randomUUID();
@@ -243,7 +163,7 @@ app.post('/api/orders', (req, res) => {
     createdAt: new Date().toISOString(),
     status: 'novo',
     timeLimitMinutes: timeLimit,
-    deliveryType: req.body.deliveryType || 'entrega',   // ← NOVO
+    deliveryType: req.body.deliveryType || 'entrega',
     customer: req.body.customer,
     items: req.body.items,
     payment: req.body.payment,
@@ -301,7 +221,6 @@ app.get('/api/orders/:id/stream', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // Envia estado inicial
   const order = orders.get(id);
   if (order) {
     res.write(`data: ${JSON.stringify({
@@ -312,10 +231,8 @@ app.get('/api/orders/:id/stream', (req, res) => {
     })}\n\n`);
   }
 
-  // Heartbeat
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
 
-  // Registra
   if (!clientStreams.has(id)) clientStreams.set(id, new Set());
   clientStreams.get(id).add(res);
   console.log(`[SSE-CLIENTE] Pedido ${id.slice(0,6)} conectado`);
@@ -402,8 +319,7 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
 
   broadcastToAdmins({ type: 'order_updated', order });
 
-  // Notifica o cliente
-    const isRetirada = order.deliveryType === 'retirada';
+  const isRetirada = order.deliveryType === 'retirada';
   const messages = {
     preparando:    isRetirada ? 'Seu pedido está sendo preparado! 🔥' : 'Sua pizza está no forno! 🔥',
     saiu_entrega:  isRetirada ? 'Seu pedido está pronto para retirada! 🏠' : 'Sua pizza saiu para entrega! 🛵',
