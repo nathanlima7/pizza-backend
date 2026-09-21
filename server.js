@@ -1,15 +1,13 @@
 // ============================================================
-// PIZZA DA FAMÍLIA - BACKEND v3
+// PIZZA DA FAMÍLIA - BACKEND v4
 // Node.js + Express + SSE (cliente e ADM) + Web Push
-// + Persistência em arquivo + Exportação CSV + Push para ADM
+// Estado 100% em memória (sem persistência)
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const webpush = require('web-push');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,77 +48,7 @@ app.use(cors({
 app.use(express.json({ limit: '100kb' }));
 
 // ============================================================
-// PERSISTÊNCIA EM ARQUIVO (/tmp — funciona durante a sessão do Render)
-// ============================================================
-const DATA_DIR = '/tmp/pizza-data';
-const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
-const PUSH_ADM_FILE = path.join(DATA_DIR, 'push-adm.json');
-const MAX_ORDERS = 500;
-
-function ensureDataDir() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch (e) { console.warn('Erro ao criar dir de dados:', e.message); }
-}
-
-function persistOrders() {
-  try {
-    ensureDataDir();
-    const data = {
-      orders: Array.from(orders.values()),
-      tokens: Array.from(orderTokens.entries()),
-      pushSubs: Array.from(pushSubscriptions.entries())
-    };
-    fs.writeFileSync(ORDERS_FILE, JSON.stringify(data), 'utf8');
-  } catch (e) { console.warn('Erro ao persistir pedidos:', e.message); }
-}
-
-function restoreOrders() {
-  try {
-    ensureDataDir();
-    if (!fs.existsSync(ORDERS_FILE)) return;
-    const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-
-    // Formato novo (objeto com orders, tokens, pushSubs)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      (parsed.orders || []).forEach(o => { if (o && o.id) orders.set(o.id, o); });
-      (parsed.tokens || []).forEach(([id, tk]) => orderTokens.set(id, tk));
-      (parsed.pushSubs || []).forEach(([id, sub]) => pushSubscriptions.set(id, sub));
-      console.log(`📦 Restaurado: ${orders.size} pedidos, ${orderTokens.size} tokens, ${pushSubscriptions.size} push subs`);
-    }
-    // Formato antigo (array simples) — compatibilidade
-    else if (Array.isArray(parsed)) {
-      parsed.forEach(o => { if (o && o.id) orders.set(o.id, o); });
-      console.log(`📦 ${orders.size} pedidos restaurados (formato antigo, sem tokens)`);
-    }
-  } catch (e) { console.warn('Erro ao restaurar:', e.message); }
-}
-
-function persistAdmPush() {
-  try {
-    ensureDataDir();
-    const arr = Array.from(admPushSubscriptions.values());
-    fs.writeFileSync(PUSH_ADM_FILE, JSON.stringify(arr), 'utf8');
-  } catch (e) { console.warn('Erro ao persistir push ADM:', e.message); }
-}
-
-function restoreAdmPush() {
-  try {
-    ensureDataDir();
-    if (!fs.existsSync(PUSH_ADM_FILE)) return;
-    const raw = fs.readFileSync(PUSH_ADM_FILE, 'utf8');
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return;
-    arr.forEach(sub => {
-      if (sub && sub.endpoint) admPushSubscriptions.set(sub.endpoint, sub);
-    });
-    console.log(`📦 ${admPushSubscriptions.size} subscriptions ADM restauradas`);
-  } catch (e) { console.warn('Erro ao restaurar push ADM:', e.message); }
-}
-
-// ============================================================
-// ESTADO
+// ESTADO (tudo em memória)
 // ============================================================
 const orders = new Map();                    // id -> order
 const orderTokens = new Map();               // id -> token do cliente
@@ -128,7 +56,9 @@ const clientStreams = new Map();             // id -> Set(res)
 const adminStreams = new Set();              // Set(res)
 const pushSubscriptions = new Map();         // id -> subscription (cliente)
 const admPushSubscriptions = new Map();      // endpoint -> subscription (ADM)
+const MAX_ORDERS = 200;
 
+// ---------- Tempo alvo por bairro (minutos) ----------
 const TIME_LIMITS = {
   'Centro': 20,
   'Novo Horizonte': 25,
@@ -190,13 +120,30 @@ async function sendAdmPush(payload) {
     }
   }
   toDelete.forEach(ep => admPushSubscriptions.delete(ep));
-  if (toDelete.length) persistAdmPush();
 }
 
 function notifyClient(orderId, status, message) {
-  const payload = { type: 'status', status, message, timestamp: new Date().toISOString() };
+  const payload = {
+    type: 'status',
+    status,
+    message,
+    timestamp: new Date().toISOString()
+  };
+
+  // Canal 1: SSE (app aberto)
   sendToClientStreams(orderId, payload);
-  sendWebPush(orderId, { title: 'Pizza da Família 🍕', body: message, url: '/' });
+
+  // Canal 2: Web Push (app fechado)
+  sendWebPush(orderId, {
+    title: 'Pizza da Família 🍕',
+    body: message,
+    url: '/'
+  });
+
+  // Diagnóstico
+  const hasSSE = clientStreams.has(orderId);
+  const hasPush = pushSubscriptions.has(orderId);
+  console.log(`[NOTIFY] ${orderId.slice(0,6)} → SSE: ${hasSSE ? '✅' : '❌'} | Push: ${hasPush ? '✅' : '❌'}`);
 }
 
 function requireAdmin(req, res, next) {
@@ -267,7 +214,7 @@ app.post('/api/orders', (req, res) => {
     const toDelete = [];
     for (const [id, o] of orders) {
       if (o.status === 'entregue') toDelete.push(id);
-      if (toDelete.length >= 50) break;
+      if (toDelete.length >= 30) break;
     }
     toDelete.forEach(id => {
       orders.delete(id);
@@ -277,10 +224,9 @@ app.post('/api/orders', (req, res) => {
     });
   }
 
-  persistOrders();
   broadcastToAdmins({ type: 'new_order', order });
 
-  // Push para o ADM (mesmo que o painel esteja fechado)
+  // Push para o ADM
   sendAdmPush({
     title: '🍕 Novo pedido!',
     body: `${order.customer.name} • ${isRetirada ? 'Retirada' : order.customer.neighborhood} • R$ ${order.total.toFixed(2)}`,
@@ -326,6 +272,7 @@ app.get('/api/orders/:id/stream', (req, res) => {
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
   if (!clientStreams.has(id)) clientStreams.set(id, new Set());
   clientStreams.get(id).add(res);
+  console.log(`[SSE-CLIENTE] ${id.slice(0,6)} conectado`);
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -347,7 +294,7 @@ app.post('/api/push/subscribe', (req, res) => {
     return res.status(400).json({ error: 'Subscription inválida' });
   }
   pushSubscriptions.set(orderId, subscription);
-  persistOrders();
+  console.log(`[PUSH-CLIENTE] Sub registrada (${orderId.slice(0,6)})`);
   res.json({ ok: true });
 });
 
@@ -401,7 +348,6 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
   order.status = status;
   order.updatedAt = new Date().toISOString();
 
-  persistOrders();
   broadcastToAdmins({ type: 'order_updated', order });
 
   const isRetirada = order.deliveryType === 'retirada';
@@ -429,23 +375,19 @@ app.post('/api/admin/orders/:id/message', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Nova: limpar todos os pedidos (Encerrar expediente) ----------
+// ---------- Limpar todos os pedidos ----------
 app.delete('/api/admin/orders', requireAdmin, (req, res) => {
   const count = orders.size;
   orders.clear();
   orderTokens.clear();
   clientStreams.clear();
   pushSubscriptions.clear();
-  persistOrders();
-
-  // Notifica todos os ADMs conectados
   broadcastToAdmins({ type: 'all_cleared' });
-
-  console.log(`[LIMPEZA] ${count} pedidos removidos pelo ADM`);
+  console.log(`[LIMPEZA] ${count} pedidos removidos`);
   res.json({ ok: true, cleared: count });
 });
 
-// ---------- Nova: exportar CSV ----------
+// ---------- Exportar CSV ----------
 app.get('/api/admin/orders/export', requireAdmin, (req, res) => {
   const list = Array.from(orders.values())
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
@@ -507,7 +449,7 @@ app.get('/api/admin/orders/export', requireAdmin, (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(csv);
 
-  console.log(`[EXPORT] CSV gerado com ${list.length} pedidos`);
+  console.log(`[EXPORT] CSV com ${list.length} pedidos`);
 });
 
 // ---------- Push do ADM ----------
@@ -517,8 +459,7 @@ app.post('/api/admin/push/subscribe', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Subscription inválida' });
   }
   admPushSubscriptions.set(subscription.endpoint, subscription);
-  persistAdmPush();
-  console.log(`[PUSH-ADM] Subscription registrada (${admPushSubscriptions.size} total)`);
+  console.log(`[PUSH-ADM] Sub registrada (${admPushSubscriptions.size} total)`);
   res.json({ ok: true });
 });
 
@@ -530,8 +471,10 @@ app.get('/api/health', (req, res) => {
     ok: true,
     uptime: process.uptime(),
     orders: orders.size,
+    orderTokens: orderTokens.size,
     adminStreams: adminStreams.size,
     clientStreams: clientStreams.size,
+    pushClientSubs: pushSubscriptions.size,
     admPushSubs: admPushSubscriptions.size,
     push: pushEnabled
   });
@@ -540,9 +483,6 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 // START
 // ============================================================
-restoreOrders();
-restoreAdmPush();
-
 app.listen(PORT, () => {
-  console.log(`🍕 Backend Pizza da Família v3 na porta ${PORT}`);
+  console.log(`🍕 Backend Pizza da Família v4 (sem persistência) na porta ${PORT}`);
 });
