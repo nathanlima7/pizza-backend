@@ -66,8 +66,12 @@ function ensureDataDir() {
 function persistOrders() {
   try {
     ensureDataDir();
-    const arr = Array.from(orders.values());
-    fs.writeFileSync(ORDERS_FILE, JSON.stringify(arr), 'utf8');
+    const data = {
+      orders: Array.from(orders.values()),
+      tokens: Array.from(orderTokens.entries()),
+      pushSubs: Array.from(pushSubscriptions.entries())
+    };
+    fs.writeFileSync(ORDERS_FILE, JSON.stringify(data), 'utf8');
   } catch (e) { console.warn('Erro ao persistir pedidos:', e.message); }
 }
 
@@ -76,13 +80,21 @@ function restoreOrders() {
     ensureDataDir();
     if (!fs.existsSync(ORDERS_FILE)) return;
     const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return;
-    arr.forEach(o => {
-      if (o && o.id) orders.set(o.id, o);
-    });
-    console.log(`📦 ${orders.size} pedidos restaurados do disco`);
-  } catch (e) { console.warn('Erro ao restaurar pedidos:', e.message); }
+    const parsed = JSON.parse(raw);
+
+    // Formato novo (objeto com orders, tokens, pushSubs)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      (parsed.orders || []).forEach(o => { if (o && o.id) orders.set(o.id, o); });
+      (parsed.tokens || []).forEach(([id, tk]) => orderTokens.set(id, tk));
+      (parsed.pushSubs || []).forEach(([id, sub]) => pushSubscriptions.set(id, sub));
+      console.log(`📦 Restaurado: ${orders.size} pedidos, ${orderTokens.size} tokens, ${pushSubscriptions.size} push subs`);
+    }
+    // Formato antigo (array simples) — compatibilidade
+    else if (Array.isArray(parsed)) {
+      parsed.forEach(o => { if (o && o.id) orders.set(o.id, o); });
+      console.log(`📦 ${orders.size} pedidos restaurados (formato antigo, sem tokens)`);
+    }
+  } catch (e) { console.warn('Erro ao restaurar:', e.message); }
 }
 
 function persistAdmPush() {
@@ -335,6 +347,7 @@ app.post('/api/push/subscribe', (req, res) => {
     return res.status(400).json({ error: 'Subscription inválida' });
   }
   pushSubscriptions.set(orderId, subscription);
+  persistOrders();
   res.json({ ok: true });
 });
 
