@@ -1,12 +1,15 @@
 // ============================================================
-// PIZZA DA FAMÍLIA - BACKEND v2
+// PIZZA DA FAMÍLIA - BACKEND v3
 // Node.js + Express + SSE (cliente e ADM) + Web Push
+// + Persistência em arquivo + Exportação CSV + Push para ADM
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const webpush = require('web-push');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,7 +20,7 @@ const VAPID_PUBLIC  = process.env.VAPID_PUBLIC  || '';
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contato@pizzadafamilia.com';
 
-// ---------- Configurar Web Push (se as chaves existirem) ----------
+// ---------- Web Push ----------
 let pushEnabled = false;
 if (VAPID_PUBLIC && VAPID_PRIVATE) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -32,6 +35,7 @@ const ALLOWED_ORIGINS = [
   'https://pizzadafamilia.netlify.app',
   'https://pizzadafamilia-test.netlify.app',
   'https://admindafamilia.netlify.app',
+  'https://admindafamilia-test.netlify.app',
   'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500'
@@ -45,15 +49,74 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '100kb' }));
 
-// ---------- Estado em memória ----------
-const orders = new Map();
-const orderTokens = new Map();
-const clientStreams = new Map();
-const adminStreams = new Set();
-const pushSubscriptions = new Map();
-const MAX_ORDERS = 200;
+// ============================================================
+// PERSISTÊNCIA EM ARQUIVO (/tmp — funciona durante a sessão do Render)
+// ============================================================
+const DATA_DIR = '/tmp/pizza-data';
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+const PUSH_ADM_FILE = path.join(DATA_DIR, 'push-adm.json');
+const MAX_ORDERS = 500;
 
-// ---------- Tempo alvo por bairro (minutos) ----------
+function ensureDataDir() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (e) { console.warn('Erro ao criar dir de dados:', e.message); }
+}
+
+function persistOrders() {
+  try {
+    ensureDataDir();
+    const arr = Array.from(orders.values());
+    fs.writeFileSync(ORDERS_FILE, JSON.stringify(arr), 'utf8');
+  } catch (e) { console.warn('Erro ao persistir pedidos:', e.message); }
+}
+
+function restoreOrders() {
+  try {
+    ensureDataDir();
+    if (!fs.existsSync(ORDERS_FILE)) return;
+    const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    arr.forEach(o => {
+      if (o && o.id) orders.set(o.id, o);
+    });
+    console.log(`📦 ${orders.size} pedidos restaurados do disco`);
+  } catch (e) { console.warn('Erro ao restaurar pedidos:', e.message); }
+}
+
+function persistAdmPush() {
+  try {
+    ensureDataDir();
+    const arr = Array.from(admPushSubscriptions.values());
+    fs.writeFileSync(PUSH_ADM_FILE, JSON.stringify(arr), 'utf8');
+  } catch (e) { console.warn('Erro ao persistir push ADM:', e.message); }
+}
+
+function restoreAdmPush() {
+  try {
+    ensureDataDir();
+    if (!fs.existsSync(PUSH_ADM_FILE)) return;
+    const raw = fs.readFileSync(PUSH_ADM_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    arr.forEach(sub => {
+      if (sub && sub.endpoint) admPushSubscriptions.set(sub.endpoint, sub);
+    });
+    console.log(`📦 ${admPushSubscriptions.size} subscriptions ADM restauradas`);
+  } catch (e) { console.warn('Erro ao restaurar push ADM:', e.message); }
+}
+
+// ============================================================
+// ESTADO
+// ============================================================
+const orders = new Map();                    // id -> order
+const orderTokens = new Map();               // id -> token do cliente
+const clientStreams = new Map();             // id -> Set(res)
+const adminStreams = new Set();              // Set(res)
+const pushSubscriptions = new Map();         // id -> subscription (cliente)
+const admPushSubscriptions = new Map();      // endpoint -> subscription (ADM)
+
 const TIME_LIMITS = {
   'Centro': 20,
   'Novo Horizonte': 25,
@@ -92,28 +155,36 @@ async function sendWebPush(orderId, payload) {
   if (!sub) return;
   try {
     await webpush.sendNotification(sub, JSON.stringify(payload));
-    console.log(`📲 Push enviado para pedido ${orderId.slice(0,6)}`);
+    console.log(`📲 Push cliente enviado (${orderId.slice(0,6)})`);
   } catch (err) {
-    console.warn('Falha no push:', err.statusCode);
+    console.warn('Falha no push cliente:', err.statusCode);
     if (err.statusCode === 404 || err.statusCode === 410) {
       pushSubscriptions.delete(orderId);
     }
   }
 }
 
+async function sendAdmPush(payload) {
+  if (!pushEnabled || admPushSubscriptions.size === 0) return;
+  const data = JSON.stringify(payload);
+  const toDelete = [];
+  for (const [endpoint, sub] of admPushSubscriptions) {
+    try {
+      await webpush.sendNotification(sub, data);
+      console.log('📲 Push ADM enviado');
+    } catch (err) {
+      console.warn('Falha push ADM:', err.statusCode);
+      if (err.statusCode === 404 || err.statusCode === 410) toDelete.push(endpoint);
+    }
+  }
+  toDelete.forEach(ep => admPushSubscriptions.delete(ep));
+  if (toDelete.length) persistAdmPush();
+}
+
 function notifyClient(orderId, status, message) {
-  const payload = {
-    type: 'status',
-    status,
-    message,
-    timestamp: new Date().toISOString()
-  };
+  const payload = { type: 'status', status, message, timestamp: new Date().toISOString() };
   sendToClientStreams(orderId, payload);
-  sendWebPush(orderId, {
-    title: 'Pizza da Família 🍕',
-    body: message,
-    url: '/'
-  });
+  sendWebPush(orderId, { title: 'Pizza da Família 🍕', body: message, url: '/' });
 }
 
 function requireAdmin(req, res, next) {
@@ -130,7 +201,6 @@ function validateOrder(body) {
   if (!Array.isArray(body.items) || body.items.length === 0) errors.push('Pedido sem itens');
   if (typeof body.total !== 'number') errors.push('Total inválido');
 
-  // Bairro só é obrigatório se for ENTREGA (não retirada)
   const isRetirada = body.deliveryType === 'retirada';
   if (!isRetirada && !body.customer?.neighborhood) {
     errors.push('Bairro é obrigatório para entrega');
@@ -138,11 +208,16 @@ function validateOrder(body) {
   return errors;
 }
 
+function csvEscape(v) {
+  if (v == null) return '';
+  const s = String(v).replace(/"/g, '""');
+  return `"${s}"`;
+}
+
 // ============================================================
 // ROTAS PÚBLICAS (cliente)
 // ============================================================
 
-// ---------- POST /api/orders — cria pedido ----------
 app.post('/api/orders', (req, res) => {
   const errors = validateOrder(req.body);
   if (errors.length > 0) {
@@ -152,7 +227,6 @@ app.post('/api/orders', (req, res) => {
   const orderId = crypto.randomUUID();
   const clientToken = crypto.randomBytes(24).toString('hex');
 
-  // ---------- Tempo alvo: retirada ou por bairro ----------
   const isRetirada = req.body.deliveryType === 'retirada';
   const timeLimit = isRetirada
     ? TIME_LIMITS['Retirada no local']
@@ -181,7 +255,7 @@ app.post('/api/orders', (req, res) => {
     const toDelete = [];
     for (const [id, o] of orders) {
       if (o.status === 'entregue') toDelete.push(id);
-      if (toDelete.length >= 20) break;
+      if (toDelete.length >= 50) break;
     }
     toDelete.forEach(id => {
       orders.delete(id);
@@ -191,7 +265,15 @@ app.post('/api/orders', (req, res) => {
     });
   }
 
+  persistOrders();
   broadcastToAdmins({ type: 'new_order', order });
+
+  // Push para o ADM (mesmo que o painel esteja fechado)
+  sendAdmPush({
+    title: '🍕 Novo pedido!',
+    body: `${order.customer.name} • ${isRetirada ? 'Retirada' : order.customer.neighborhood} • R$ ${order.total.toFixed(2)}`,
+    url: '/'
+  });
 
   const local = isRetirada ? 'Retirada' : (order.customer.neighborhood || '—');
   console.log(`[NOVO] ${order.customer.name} • ${local} • R$ ${order.total.toFixed(2)}`);
@@ -205,12 +287,10 @@ app.post('/api/orders', (req, res) => {
   });
 });
 
-// ---------- GET /api/orders/:id/stream — SSE do cliente ----------
 app.get('/api/orders/:id/stream', (req, res) => {
   const { id } = req.params;
   const token = req.query.token;
   const expected = orderTokens.get(id);
-
   if (!expected || token !== expected) {
     return res.status(401).json({ error: 'Token inválido' });
   }
@@ -232,10 +312,8 @@ app.get('/api/orders/:id/stream', (req, res) => {
   }
 
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
-
   if (!clientStreams.has(id)) clientStreams.set(id, new Set());
   clientStreams.get(id).add(res);
-  console.log(`[SSE-CLIENTE] Pedido ${id.slice(0,6)} conectado`);
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -244,28 +322,22 @@ app.get('/api/orders/:id/stream', (req, res) => {
       set.delete(res);
       if (set.size === 0) clientStreams.delete(id);
     }
-    console.log(`[SSE-CLIENTE] Pedido ${id.slice(0,6)} desconectado`);
   });
 });
 
-// ---------- POST /api/push/subscribe — registro de push ----------
 app.post('/api/push/subscribe', (req, res) => {
   const { orderId, clientToken, subscription } = req.body;
   const expected = orderTokens.get(orderId);
-
   if (!expected || clientToken !== expected) {
     return res.status(401).json({ error: 'Token inválido' });
   }
   if (!subscription || !subscription.endpoint) {
     return res.status(400).json({ error: 'Subscription inválida' });
   }
-
   pushSubscriptions.set(orderId, subscription);
-  console.log(`[PUSH] Subscription registrada para pedido ${orderId.slice(0,6)}`);
   res.json({ ok: true });
 });
 
-// ---------- GET /api/vapid-public-key ----------
 app.get('/api/vapid-public-key', (req, res) => {
   res.json({ key: pushEnabled ? VAPID_PUBLIC : null });
 });
@@ -298,7 +370,6 @@ app.get('/api/admin/orders/stream', requireAdmin, (req, res) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     adminStreams.delete(res);
-    console.log(`[SSE-ADM] desconectado. Total: ${adminStreams.size}`);
   });
 });
 
@@ -317,6 +388,7 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
   order.status = status;
   order.updatedAt = new Date().toISOString();
 
+  persistOrders();
   broadcastToAdmins({ type: 'order_updated', order });
 
   const isRetirada = order.deliveryType === 'retirada';
@@ -328,7 +400,7 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
   };
   notifyClient(id, status, messages[status] || `Status: ${status}`);
 
-  console.log(`[STATUS] Pedido ${id.slice(0,6)} → ${status}`);
+  console.log(`[STATUS] ${id.slice(0,6)} → ${status}`);
   res.json({ ok: true, order });
 });
 
@@ -336,21 +408,109 @@ app.post('/api/admin/orders/:id/message', requireAdmin, (req, res) => {
   const { id } = req.params;
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Mensagem vazia' });
-
   const order = orders.get(id);
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
 
   sendToClientStreams(id, { type: 'message', text });
-  sendWebPush(id, {
-    title: 'Pizza da Família 🍕',
-    body: text,
-    url: '/'
+  sendWebPush(id, { title: 'Pizza da Família 🍕', body: text, url: '/' });
+  res.json({ ok: true });
+});
+
+// ---------- Nova: limpar todos os pedidos (Encerrar expediente) ----------
+app.delete('/api/admin/orders', requireAdmin, (req, res) => {
+  const count = orders.size;
+  orders.clear();
+  orderTokens.clear();
+  clientStreams.clear();
+  pushSubscriptions.clear();
+  persistOrders();
+
+  // Notifica todos os ADMs conectados
+  broadcastToAdmins({ type: 'all_cleared' });
+
+  console.log(`[LIMPEZA] ${count} pedidos removidos pelo ADM`);
+  res.json({ ok: true, cleared: count });
+});
+
+// ---------- Nova: exportar CSV ----------
+app.get('/api/admin/orders/export', requireAdmin, (req, res) => {
+  const list = Array.from(orders.values())
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+  const headers = [
+    'ID', 'Data', 'Hora', 'Status', 'Tipo',
+    'Cliente', 'Telefone', 'Bairro', 'Rua', 'Número', 'Complemento', 'Referência',
+    'Itens', 'Qtd Itens', 'Subtotal', 'Frete', 'Total',
+    'Pagamento', 'Troco',
+    'Criado em', 'Atualizado em', 'Tempo total (min)'
+  ];
+
+  const rows = list.map(o => {
+    const created = new Date(o.createdAt);
+    const updated = o.updatedAt ? new Date(o.updatedAt) : null;
+    const tempoMin = updated ? Math.round((updated - created) / 60000) : '';
+
+    const itens = (o.items || []).map(i => {
+      let s = `${i.quantity}x ${i.type === 'pizza' ? 'Pizza ' : ''}${i.name}`;
+      if (i.size) s += ` (${i.size})`;
+      if (i.flavors && i.flavors.length > 1) s += ` [${i.flavors.join(' + ')}]`;
+      if (i.border && i.border !== 'Sem borda') s += ` +borda ${i.border}`;
+      if (i.obs) s += ` obs: ${i.obs}`;
+      return s;
+    }).join(' | ');
+
+    const qtdItens = (o.items || []).reduce((s, i) => s + (i.quantity || 0), 0);
+
+    return [
+      o.id,
+      created.toLocaleDateString('pt-BR'),
+      created.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+      o.status,
+      o.deliveryType || 'entrega',
+      o.customer?.name || '',
+      o.customer?.phone || '',
+      o.customer?.neighborhood || '',
+      o.customer?.street || '',
+      o.customer?.number || '',
+      o.customer?.complement || '',
+      o.customer?.reference || '',
+      itens,
+      qtdItens,
+      (o.subtotal || 0).toFixed(2).replace('.', ','),
+      (o.deliveryFee || 0).toFixed(2).replace('.', ','),
+      (o.total || 0).toFixed(2).replace('.', ','),
+      o.payment || '',
+      o.change || '',
+      o.createdAt,
+      o.updatedAt || '',
+      tempoMin
+    ].map(csvEscape).join(';');
   });
+
+  const csv = '\uFEFF' + [headers.map(csvEscape).join(';'), ...rows].join('\r\n');
+  const filename = `relatorio-pizza-${new Date().toISOString().slice(0,10)}.csv`;
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
+
+  console.log(`[EXPORT] CSV gerado com ${list.length} pedidos`);
+});
+
+// ---------- Push do ADM ----------
+app.post('/api/admin/push/subscribe', requireAdmin, (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription || !subscription.endpoint) {
+    return res.status(400).json({ error: 'Subscription inválida' });
+  }
+  admPushSubscriptions.set(subscription.endpoint, subscription);
+  persistAdmPush();
+  console.log(`[PUSH-ADM] Subscription registrada (${admPushSubscriptions.size} total)`);
   res.json({ ok: true });
 });
 
 // ============================================================
-// HEALTH CHECK
+// HEALTH
 // ============================================================
 app.get('/api/health', (req, res) => {
   res.json({
@@ -359,6 +519,7 @@ app.get('/api/health', (req, res) => {
     orders: orders.size,
     adminStreams: adminStreams.size,
     clientStreams: clientStreams.size,
+    admPushSubs: admPushSubscriptions.size,
     push: pushEnabled
   });
 });
@@ -366,6 +527,9 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 // START
 // ============================================================
+restoreOrders();
+restoreAdmPush();
+
 app.listen(PORT, () => {
-  console.log(`🍕 Backend Pizza da Família na porta ${PORT}`);
+  console.log(`🍕 Backend Pizza da Família v3 na porta ${PORT}`);
 });
