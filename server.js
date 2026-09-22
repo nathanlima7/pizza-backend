@@ -96,7 +96,9 @@ async function sendWebPush(orderId, payload) {
   const sub = pushSubscriptions.get(orderId);
   if (!sub) return;
   try {
-    await webpush.sendNotification(sub, JSON.stringify(payload));
+    // Adiciona o orderId ao payload para o sw.js gerar tag única
+    const enriched = { ...payload, orderId };
+    await webpush.sendNotification(sub, JSON.stringify(enriched));
     console.log(`📲 Push cliente enviado (${orderId.slice(0,6)})`);
   } catch (err) {
     console.warn('Falha no push cliente:', err.statusCode);
