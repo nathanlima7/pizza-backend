@@ -58,19 +58,7 @@ const pushSubscriptions = new Map();         // id -> subscription (cliente)
 const admPushSubscriptions = new Map();      // endpoint -> subscription (ADM)
 const MAX_ORDERS = 200;
 
-// ---------- Tempo alvo por bairro (minutos) ----------
-const TIME_LIMITS = {
-  'Centro': 20,
-  'Novo Horizonte': 25,
-  'Baixa': 25,
-  'Vila': 25,
-  'Tamboril': 40,
-  'Boi Morto': 40,
-  "Buraco D'água": 40,
-  'Pitombeira': 40,
-  'Retirada no local': 15
-};
-const DEFAULT_TIME_LIMIT = 30;
+
 
 // ============================================================
 // HELPERS
@@ -189,15 +177,11 @@ app.post('/api/orders', (req, res) => {
   const clientToken = crypto.randomBytes(24).toString('hex');
 
   const isRetirada = req.body.deliveryType === 'retirada';
-  const timeLimit = isRetirada
-    ? TIME_LIMITS['Retirada no local']
-    : (TIME_LIMITS[req.body.customer?.neighborhood] || DEFAULT_TIME_LIMIT);
 
   const order = {
     id: orderId,
     createdAt: new Date().toISOString(),
     status: 'novo',
-    timeLimitMinutes: timeLimit,
     deliveryType: req.body.deliveryType || 'entrega',
     customer: req.body.customer,
     items: req.body.items,
@@ -228,7 +212,6 @@ app.post('/api/orders', (req, res) => {
 
   broadcastToAdmins({ type: 'new_order', order });
 
-  // Push para o ADM
   sendAdmPush({
     title: '🍕 Novo pedido!',
     body: `${order.customer.name} • ${isRetirada ? 'Retirada' : order.customer.neighborhood} • R$ ${order.total.toFixed(2)}`,
@@ -242,7 +225,6 @@ app.post('/api/orders', (req, res) => {
     ok: true,
     orderId,
     clientToken,
-    timeLimitMinutes: timeLimit,
     vapidPublicKey: pushEnabled ? VAPID_PUBLIC : null
   });
 });
@@ -389,18 +371,89 @@ app.delete('/api/admin/orders', requireAdmin, (req, res) => {
   res.json({ ok: true, cleared: count });
 });
 
+// ---------- Excluir um pedido específico ----------
+app.delete('/api/admin/orders/:id', requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const order = orders.get(id);
+
+  if (!order) {
+    return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
+
+  // 1. Avisa o cliente via SSE silencioso (sem push, sem toast)
+  //    para o app limpar o pizzaActiveOrder se for o pedido dele
+  const streams = clientStreams.get(id);
+  if (streams) {
+    const data = `data: ${JSON.stringify({ type: 'order_cancelled' })}\n\n`;
+    for (const clientRes of streams) {
+      try { clientRes.write(data); clientRes.end(); } catch {}
+    }
+    clientStreams.delete(id);
+  }
+
+  // 2. Remove o pedido do estado
+  orders.delete(id);
+  orderTokens.delete(id);
+  pushSubscriptions.delete(id);
+
+  // 3. Avisa todos os ADMs conectados para remover o card
+  broadcastToAdmins({ type: 'order_removed', orderId: id });
+
+  console.log(`[EXCLUSAO] Pedido ${id.slice(0,6)} removido`);
+  res.json({ ok: true, removed: id });
+});
+
 // ---------- Exportar CSV ----------
 app.get('/api/admin/orders/export', requireAdmin, (req, res) => {
   const list = Array.from(orders.values())
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
   const headers = [
-    'ID', 'Data', 'Hora', 'Status', 'Tipo',
-    'Cliente', 'Telefone', 'Bairro', 'Rua', 'Número', 'Complemento', 'Referência',
-    'Itens', 'Qtd Itens', 'Subtotal', 'Frete', 'Total',
-    'Pagamento', 'Troco',
-    'Criado em', 'Atualizado em', 'Tempo total (min)'
-  ];
+  'ID', 'Data', 'Hora', 'Status', 'Tipo',
+  'Cliente', 'Telefone', 'Bairro', 'Rua', 'Número', 'Complemento', 'Referência',
+  'Itens', 'Qtd Itens', 'Subtotal', 'Frete', 'Total',
+  'Pagamento', 'Troco',
+  'Criado em', 'Atualizado em'
+];
+
+const rows = list.map(o => {
+  const created = new Date(o.createdAt);
+
+  const itens = (o.items || []).map(i => {
+    let s = `${i.quantity}x ${i.type === 'pizza' ? 'Pizza ' : ''}${i.name}`;
+    if (i.size) s += ` (${i.size})`;
+    if (i.flavors && i.flavors.length > 1) s += ` [${i.flavors.join(' + ')}]`;
+    if (i.border && i.border !== 'Sem borda') s += ` +borda ${i.border}`;
+    if (i.obs) s += ` obs: ${i.obs}`;
+    return s;
+  }).join(' | ');
+
+  const qtdItens = (o.items || []).reduce((s, i) => s + (i.quantity || 0), 0);
+
+  return [
+    o.id,
+    created.toLocaleDateString('pt-BR'),
+    created.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    o.status,
+    o.deliveryType || 'entrega',
+    o.customer?.name || '',
+    o.customer?.phone || '',
+    o.customer?.neighborhood || '',
+    o.customer?.street || '',
+    o.customer?.number || '',
+    o.customer?.complement || '',
+    o.customer?.reference || '',
+    itens,
+    qtdItens,
+    (o.subtotal || 0).toFixed(2).replace('.', ','),
+    (o.deliveryFee || 0).toFixed(2).replace('.', ','),
+    (o.total || 0).toFixed(2).replace('.', ','),
+    o.payment || '',
+    o.change || '',
+    o.createdAt,
+    o.updatedAt || ''
+  ].map(csvEscape).join(';');
+});
 
   const rows = list.map(o => {
     const created = new Date(o.createdAt);
