@@ -404,61 +404,21 @@ app.delete('/api/admin/orders/:id', requireAdmin, (req, res) => {
 });
 
 // ---------- Exportar CSV ----------
+// ---------- Exportar CSV ----------
 app.get('/api/admin/orders/export', requireAdmin, (req, res) => {
   const list = Array.from(orders.values())
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
   const headers = [
-  'ID', 'Data', 'Hora', 'Status', 'Tipo',
-  'Cliente', 'Telefone', 'Bairro', 'Rua', 'Número', 'Complemento', 'Referência',
-  'Itens', 'Qtd Itens', 'Subtotal', 'Frete', 'Total',
-  'Pagamento', 'Troco',
-  'Criado em', 'Atualizado em'
-];
-
-const rows = list.map(o => {
-  const created = new Date(o.createdAt);
-
-  const itens = (o.items || []).map(i => {
-    let s = `${i.quantity}x ${i.type === 'pizza' ? 'Pizza ' : ''}${i.name}`;
-    if (i.size) s += ` (${i.size})`;
-    if (i.flavors && i.flavors.length > 1) s += ` [${i.flavors.join(' + ')}]`;
-    if (i.border && i.border !== 'Sem borda') s += ` +borda ${i.border}`;
-    if (i.obs) s += ` obs: ${i.obs}`;
-    return s;
-  }).join(' | ');
-
-  const qtdItens = (o.items || []).reduce((s, i) => s + (i.quantity || 0), 0);
-
-  return [
-    o.id,
-    created.toLocaleDateString('pt-BR'),
-    created.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-    o.status,
-    o.deliveryType || 'entrega',
-    o.customer?.name || '',
-    o.customer?.phone || '',
-    o.customer?.neighborhood || '',
-    o.customer?.street || '',
-    o.customer?.number || '',
-    o.customer?.complement || '',
-    o.customer?.reference || '',
-    itens,
-    qtdItens,
-    (o.subtotal || 0).toFixed(2).replace('.', ','),
-    (o.deliveryFee || 0).toFixed(2).replace('.', ','),
-    (o.total || 0).toFixed(2).replace('.', ','),
-    o.payment || '',
-    o.change || '',
-    o.createdAt,
-    o.updatedAt || ''
-  ].map(csvEscape).join(';');
-});
+    'ID', 'Data', 'Hora', 'Status', 'Tipo',
+    'Cliente', 'Telefone', 'Bairro', 'Rua', 'Número', 'Complemento', 'Referência',
+    'Itens', 'Qtd Itens', 'Subtotal', 'Frete', 'Total',
+    'Pagamento', 'Troco',
+    'Criado em', 'Atualizado em'
+  ];
 
   const rows = list.map(o => {
     const created = new Date(o.createdAt);
-    const updated = o.updatedAt ? new Date(o.updatedAt) : null;
-    const tempoMin = updated ? Math.round((updated - created) / 60000) : '';
 
     const itens = (o.items || []).map(i => {
       let s = `${i.quantity}x ${i.type === 'pizza' ? 'Pizza ' : ''}${i.name}`;
@@ -492,11 +452,11 @@ const rows = list.map(o => {
       o.payment || '',
       o.change || '',
       o.createdAt,
-      o.updatedAt || '',
-      tempoMin
+      o.updatedAt || ''
     ].map(csvEscape).join(';');
   });
 
+  // ⬇️ ESTE BLOCO ESTAVA FALTANDO
   const csv = '\uFEFF' + [headers.map(csvEscape).join(';'), ...rows].join('\r\n');
   const filename = `relatorio-pizza-${new Date().toISOString().slice(0,10)}.csv`;
 
@@ -506,6 +466,7 @@ const rows = list.map(o => {
 
   console.log(`[EXPORT] CSV com ${list.length} pedidos`);
 });
+
 
 // ---------- Push do ADM ----------
 app.post('/api/admin/push/subscribe', requireAdmin, (req, res) => {
